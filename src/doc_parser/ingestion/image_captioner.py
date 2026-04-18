@@ -1,5 +1,9 @@
-"""Multimodal chunk enricher: generates structured descriptions for images, tables,
-formulas, and algorithms via GPT-4o to improve embedding quality for retrieval."""
+"""Multimodal chunk enricher: generates structured descriptions for tables,
+formulas, and algorithms via GPT-4o to improve embedding quality for retrieval.
+
+Image/figure chunks are NOT sent to GPT-4o — instead, the PDF region is cropped and
+stored as ``chunk.image_base64`` for direct visual embedding (e.g. Qwen3-VL-Embedding).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -24,34 +28,8 @@ _MIN_CROP_SIZE_PX: int = 50
 # Table input/output limits
 _TABLE_MAX_INPUT_CHARS: int = 12_000
 _TABLE_MAX_TOKENS: int = 2000
-_IMAGE_MAX_TOKENS: int = 800
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
-
-_IMAGE_SYSTEM_PROMPT = """\
-You are a scientific figure analysis assistant for a document retrieval system.
-
-First, classify the figure into one of these types:
-CHART — bar charts, line graphs, scatter plots, pie charts, heatmaps
-DIAGRAM — flowcharts, architecture diagrams, block diagrams, network diagrams
-PHOTO — photographs, microscopy images, medical scans
-SCREENSHOT — UI screenshots, code screenshots, terminal output
-OTHER — any figure that does not fit the above categories
-
-Then analyze the figure and respond in EXACTLY this format with no extra text:
-
-TYPE: <CHART | DIAGRAM | PHOTO | SCREENSHOT | OTHER>
-CAPTION: <1-2 sentence description of what the figure shows overall — for semantic search.>
-DETAIL:
-- For CHART: describe chart type, all axis labels, data series names, key data points, and the main trend or comparison.
-- For DIAGRAM: describe all components, their labels, connections, and the overall flow or hierarchy.
-- For PHOTO: describe the subject, setting, notable features, and any annotations or labels.
-- For SCREENSHOT: describe the UI elements, visible text, layout, and what operation is shown.
-- For OTHER: describe the key visual components, their arrangement, and purpose.
-STRUCTURE: <Grouping and containment relationships — which components belong to which group or module. Use dashes for sub-items.>
-
-Be specific and technical. Reference labels, numbers, and text visible in the figure. Do not invent information not visible in the figure.\
-"""
 
 _TABLE_SYSTEM_PROMPT = """\
 You are a scientific document analysis assistant for a document retrieval system.
@@ -101,22 +79,58 @@ Use the variable names and terminology from the algorithm itself.\
 
 # ── Response parsers ──────────────────────────────────────────────────────────
 
-def _parse_image_response(text: str) -> tuple[str, str]:
-    """Return (short_caption, full_structured_text) from a GPT-4o image response."""
-    caption = ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("CAPTION:"):
-            caption = stripped[len("CAPTION:"):].strip()
-            break
-    if not caption:
-        caption = text.strip()[:200]
-    return caption, text.strip()
-
-
 def _parse_text_response(raw_original: str, enriched: str) -> tuple[str, str]:
     """Return (original_raw_for_caption, enriched_text_for_embedding)."""
     return raw_original, enriched.strip() if enriched.strip() else raw_original
+
+
+def _try_parse_json_lenient(s: str) -> dict | None:
+    """Try several strategies to extract a JSON object from an LLM response.
+
+    LLMs (especially smaller quantized ones like Qwen3-VL-4B-AWQ) often emit
+    JSON wrapped in markdown code fences, prefixed with chatty text, or with
+    other minor wrapping that breaks ``json.loads`` even when the underlying
+    object is well-formed. This helper tries, in order:
+
+      1. Strict ``json.loads`` on the original string.
+      2. Strip leading/trailing markdown code fences (``` or ```json) and retry.
+      3. Extract the substring from the first ``{`` to the last ``}`` and retry.
+
+    Returns the parsed dict on success, or ``None`` if every strategy fails.
+    """
+    if not s:
+        return None
+    s = s.strip()
+
+    # Strategy 1: strict parse
+    try:
+        result = json.loads(s)
+        return result if isinstance(result, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Strategy 2: strip markdown fences (```json ... ``` or ``` ... ```)
+    fenced = re.sub(r"^```(?:json)?\s*\n?", "", s)
+    fenced = re.sub(r"\n?```\s*$", "", fenced).strip()
+    if fenced != s:
+        try:
+            result = json.loads(fenced)
+            return result if isinstance(result, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Strategy 3: extract first balanced-looking {...} substring
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = s[start : end + 1]
+        try:
+            result = json.loads(candidate)
+            return result if isinstance(result, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return None
 
 
 def _parse_table_json_response(raw_ocr: str, json_str: str) -> tuple[str, str]:
@@ -127,10 +141,17 @@ def _parse_table_json_response(raw_ocr: str, json_str: str) -> tuple[str, str]:
         and text = semantic summary (for embedding/retrieval).
         Falls back to raw OCR on parse failure.
     """
-    try:
-        data = json.loads(json_str)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("Table JSON parse failed, falling back to raw OCR")
+    data = _try_parse_json_lenient(json_str)
+    if data is None:
+        # Log the actual response so we can see what the model produced.
+        # This is the difference between "JSON parse failed (no idea why)"
+        # and "ah, the model returned prose because the input wasn't tabular".
+        preview = (json_str or "")[:500].replace("\n", "\\n")
+        logger.warning(
+            "Table JSON parse failed, falling back to raw OCR. "
+            "Response preview (first 500 chars): %s",
+            preview,
+        )
         return raw_ocr, raw_ocr
 
     markdown_table = data.get("markdown_table", "")
@@ -145,6 +166,28 @@ def _parse_table_json_response(raw_ocr: str, json_str: str) -> tuple[str, str]:
     text = summary if summary else raw_ocr
 
     return caption, text
+
+
+def _looks_like_table(text: str) -> bool:
+    """Heuristic: True if ``text`` looks like tabular data, False if it's prose.
+
+    Used as a pre-filter so we skip the table-extraction LLM call when the
+    layout detector has mis-classified a caption paragraph (e.g. "Table 1:
+    Runtime characteristics...", "Figure 3: Page 6 of the DocLayNet paper...")
+    as a ``table`` region. Real tables OCR'd by GLM-OCR come back as
+    pipe-delimited markdown; mis-classified caption text has zero pipes.
+    """
+    if not text or not text.strip():
+        return False
+    # GLM-OCR emits markdown-formatted tables with `|` separators. Real tables
+    # have many; prose has none.
+    if text.count("|") >= 3:
+        return True
+    # Tab-separated layouts are uncommon from GLM-OCR but possible from other
+    # OCR backends. Cheap to check.
+    if text.count("\t") >= 3:
+        return True
+    return False
 
 
 def _validate_table_extraction(
@@ -182,102 +225,39 @@ def _validate_table_extraction(
     return True
 
 
-def _get_surrounding_context(chunks: list[Chunk], idx: int, max_chars: int = 400) -> str:
-    """Extract text from adjacent text chunks for document context.
-
-    Looks up to 2 positions before and after the target chunk,
-    within the same or adjacent pages.
-    """
-    target = chunks[idx]
-    parts: list[str] = []
-
-    # Look backward
-    for i in range(max(0, idx - 2), idx):
-        c = chunks[i]
-        if c.modality == "text" and abs(c.page - target.page) <= 1:
-            parts.append(c.text[:max_chars])
-
-    # Look forward
-    for i in range(idx + 1, min(len(chunks), idx + 3)):
-        c = chunks[i]
-        if c.modality == "text" and abs(c.page - target.page) <= 1:
-            parts.append(c.text[:max_chars])
-
-    combined = " ... ".join(parts)
-    return combined[:max_chars * 2] if combined else ""
-
-
 # ── Per-modality enrichment helpers ──────────────────────────────────────────
 
-async def _enrich_image_single(
-    chunk: Chunk,
-    pdf_path: Path,
-    client: AsyncOpenAI,
-    semaphore: asyncio.Semaphore,
-    model: str,
-    surrounding_context: str = "",
-) -> None:
-    """Crop the PDF region and generate a structured image description in-place."""
-    async with semaphore:
-        try:
-            page_img = pdf_page_to_image(pdf_path, chunk.page - 1, dpi=150)
-            w, h = page_img.size
+def _crop_image_chunk(chunk: Chunk, pdf_path: Path) -> str | None:
+    """Crop the PDF region for an image chunk and return a base64-encoded PNG string.
 
-            bbox = chunk.bbox  # normalised 0–1000 coords
-            x1 = int(bbox[0] * w / 1000)
-            y1 = int(bbox[1] * h / 1000)
-            x2 = int(bbox[2] * w / 1000)
-            y2 = int(bbox[3] * h / 1000)
+    Returns the base64 string on success, or ``None`` if the crop is too small
+    (likely a detection artefact) or if an error occurs.
+    """
+    try:
+        page_img = pdf_page_to_image(pdf_path, chunk.page - 1, dpi=150)
+        w, h = page_img.size
 
-            crop = page_img.crop((x1, y1, x2, y2))
-            if crop.size[0] < _MIN_CROP_SIZE_PX or crop.size[1] < _MIN_CROP_SIZE_PX:
-                logger.debug(
-                    "Skipping tiny crop (%dx%d) for chunk %s",
-                    crop.size[0], crop.size[1], chunk.chunk_id,
-                )
-                chunk.text = "[figure]"
-                return
+        bbox = chunk.bbox  # normalised 0–1000 coords
+        x1 = int(bbox[0] * w / 1000)
+        y1 = int(bbox[1] * h / 1000)
+        x2 = int(bbox[2] * w / 1000)
+        y2 = int(bbox[3] * h / 1000)
 
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode()
-
-            user_content: list[dict] = []
-            if surrounding_context:
-                user_content.append({
-                    "type": "text",
-                    "text": (
-                        f"Surrounding document context (use for reference):\n"
-                        f"{surrounding_context}"
-                    ),
-                })
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
-            })
-
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": _IMAGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                max_tokens=_IMAGE_MAX_TOKENS,
-                temperature=0.0,
+        crop = page_img.crop((x1, y1, x2, y2))
+        if crop.size[0] < _MIN_CROP_SIZE_PX or crop.size[1] < _MIN_CROP_SIZE_PX:
+            logger.debug(
+                "Skipping tiny crop (%dx%d) for chunk %s",
+                crop.size[0], crop.size[1], chunk.chunk_id,
             )
+            return None
 
-            raw_response = (response.choices[0].message.content or "").strip()
-            caption, full_text = _parse_image_response(raw_response)
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
 
-            chunk.caption = caption
-            chunk.text = full_text
-            chunk.image_base64 = b64
-
-            logger.debug("Enriched image chunk %s: %s", chunk.chunk_id, caption[:80])
-
-        except Exception:
-            logger.warning("Image enrichment failed for chunk %s", chunk.chunk_id, exc_info=True)
-            chunk.text = "[figure]"
+    except Exception:
+        logger.warning("PDF crop failed for chunk %s", chunk.chunk_id, exc_info=True)
+        return None
 
 
 async def _enrich_table_single(
@@ -469,19 +449,20 @@ async def enrich_chunks(
     model: str = "gpt-4o",
     max_concurrent: int = 5,
 ) -> list[Chunk]:
-    """Enrich all non-text chunks with GPT-4o generated structured descriptions.
+    """Enrich non-text chunks for improved retrieval quality.
 
     Dispatches by modality:
-    - image   → structured TYPE / CAPTION / DETAIL / STRUCTURE description (vision call
-                with surrounding document context for better understanding)
-    - table   → complete markdown table reproduction + semantic summary (JSON mode)
-    - formula → SUMMARY / DETAIL verbal description (text call)
-    - algorithm → SUMMARY / DETAIL semantic description (text call)
+    - image   → PDF region is cropped and stored as ``chunk.image_base64`` (base64 PNG)
+                for direct visual embedding (e.g. Qwen3-VL-Embedding).  No LLM call is
+                made; ``chunk.caption`` is set to ``None`` and ``chunk.text`` is preserved
+                from the chunker (e.g. figure title) or falls back to ``"[figure]"``.
+    - table   → complete markdown table reproduction + semantic summary (JSON mode, GPT-4o)
+    - formula → SUMMARY / DETAIL verbal description (text call, GPT-4o)
+    - algorithm → SUMMARY / DETAIL semantic description (text call, GPT-4o)
     - text    → unchanged
 
     For tables, ``chunk.caption`` holds the full markdown table (for the generation
     LLM) and ``chunk.text`` holds the semantic summary (for embedding/retrieval).
-    For images, ``chunk.caption`` holds the short 1-2 sentence caption line.
 
     Args:
         chunks: All chunks from the document (mixed modalities).
@@ -491,28 +472,71 @@ async def enrich_chunks(
         max_concurrent: Max concurrent API calls (shared semaphore across all modalities).
 
     Returns:
-        The same list mutated in-place with enriched ``text`` and ``caption`` fields.
+        The same list mutated in-place with enriched ``text``, ``caption``, and
+        ``image_base64`` fields.
     """
     semaphore = asyncio.Semaphore(max_concurrent)
     tasks = []
 
     counts: dict[str, int] = defaultdict(int)
 
-    for idx, chunk in enumerate(chunks):
+    for chunk in chunks:
         if chunk.modality == "image":
+            counts["image"] += 1
             if chunk.bbox is not None:
-                context = _get_surrounding_context(chunks, idx)
-                tasks.append(
-                    _enrich_image_single(
-                        chunk, pdf_path, client, semaphore, model,
-                        surrounding_context=context,
-                    )
-                )
-                counts["image"] += 1
+                b64 = _crop_image_chunk(chunk, pdf_path)
+                if b64 is not None:
+                    chunk.image_base64 = b64
+                    chunk.caption = None
+                    if not chunk.text:
+                        chunk.text = "[figure]"
+                    logger.debug("Cropped image chunk %s for visual embedding", chunk.chunk_id)
+                else:
+                    # Crop too small or failed — treat as placeholder
+                    chunk.caption = None
+                    chunk.text = chunk.text or "[figure]"
             else:
                 logger.debug("Image chunk %s has no bbox; setting text='[figure]'", chunk.chunk_id)
-                chunk.text = "[figure]"
+                chunk.caption = None
+                chunk.text = chunk.text or "[figure]"
         elif chunk.modality == "table":
+            # Always crop the table region first — the pixel crop is the most
+            # reliable multi-modal signal we have. Both the reranker and the
+            # generation LLM use this crop alongside any extracted text, and
+            # for tables where GLM-OCR failed to emit pipe-delimited markdown
+            # (see the skip branch below) the crop is the ONLY way the VLM
+            # can "see" the table structure.
+            if chunk.bbox is not None:
+                b64 = _crop_image_chunk(chunk, pdf_path)
+                if b64 is not None:
+                    chunk.image_base64 = b64
+
+            # Pre-filter: PP-DocLayoutV3 sometimes mis-classifies caption
+            # paragraphs (e.g. "Table 1: Runtime characteristics...",
+            # "Figure 3: Page 6 of the DocLayNet paper...") as table regions.
+            # The OCR text for those is plain prose with no pipe delimiters,
+            # which makes the table-extraction LLM call wasteful (the model
+            # has no actual table to convert to JSON) and also pollutes the
+            # generate-time context with confusing "Full table data:" labels.
+            #
+            # We skip the LLM enrichment call for these chunks, but we TRUST
+            # the layout detector's label: modality stays "table" so retrieval
+            # still surfaces this chunk when the user asks a table question.
+            # Previously we demoted modality→text here, which ate real tables
+            # whose OCR output happened to have fewer than 3 pipe characters
+            # (short tables, numeric-only cells, truncated headers, etc.).
+            if not _looks_like_table(chunk.text):
+                logger.info(
+                    "Skipping LLM extraction for chunk %s (no tabular markers: "
+                    "pipes=%d, len=%d) — keeping modality=table, image cropped=%s",
+                    chunk.chunk_id,
+                    chunk.text.count("|"),
+                    len(chunk.text),
+                    chunk.image_base64 is not None,
+                )
+                counts["table_skipped"] += 1
+                continue
+
             tasks.append(
                 _enrich_table_single(chunk, client, semaphore, model, pdf_path=pdf_path)
             )
@@ -530,9 +554,10 @@ async def enrich_chunks(
     await asyncio.gather(*tasks)
 
     logger.info(
-        "Enriched %d image / %d table / %d formula / %d algorithm chunks from %s",
+        "Processed %d image (cropped, no LLM) / %d table / %d formula / %d algorithm "
+        "(+%d table LLM-skipped, modality preserved) chunks from %s",
         counts["image"], counts["table"], counts["formula"], counts["algorithm"],
-        pdf_path.name,
+        counts["table_skipped"], pdf_path.name,
     )
     return chunks
 
